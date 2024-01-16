@@ -8,7 +8,44 @@ where
     U: Send + 'static + Default,
 {
     let mut output_vec: Vec<U> = Vec::with_capacity(input_vec.len());
-    // TODO: implement parallel map!
+    output_vec.resize_with(input_vec.len(), Default::default);
+
+    let (input_sender, input_receiver) = crossbeam_channel::unbounded();
+    let (output_sender, output_receiver) = crossbeam_channel::unbounded();
+
+    let mut threads = Vec::new();
+    for _ in 0..num_threads {
+        let input_receiver = input_receiver.clone();
+        let output_sender = output_sender.clone();
+        threads.push(thread::spawn(move || {
+            while let Ok(elem_pair) = input_receiver.recv() {
+                // receive the tuple and send back the processed pair
+                let (idx, data) = elem_pair;
+                output_sender
+                    .send((idx, f(data)))
+                    .expect("no receivers found in output channel!");
+            }
+        }));
+    }
+
+    for i in (0..input_vec.len()).rev() {
+        input_sender
+            .send((i, input_vec.pop().unwrap()))
+            .expect("no receivers found in input channel!");
+    }
+
+    drop(input_sender);
+    drop(output_sender);
+
+    while let Ok(elem_pair) = output_receiver.recv() {
+        let (idx, data) = elem_pair;
+        output_vec[idx] = data;
+    }
+
+    // join the threads until all work finishes
+    for thread in threads {
+        thread.join().expect("Panic occurred in thread!");
+    }
     output_vec
 }
 
