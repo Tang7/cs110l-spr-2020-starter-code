@@ -3,7 +3,10 @@ mod response;
 
 use clap::Parser;
 use rand::{Rng, SeedableRng};
-use std::net::{TcpListener, TcpStream};
+use std::{
+    net::{TcpListener, TcpStream},
+    thread,
+};
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -31,6 +34,7 @@ struct CmdOptions {
 /// to, what servers have failed, rate limiting counts, etc.)
 ///
 /// You should add fields to this struct in later milestones.
+#[derive(Clone)]
 struct ProxyState {
     /// How frequently we check whether upstream servers are alive (Milestone 4)
     #[allow(dead_code)]
@@ -78,11 +82,22 @@ fn main() {
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
     };
-    for stream in listener.incoming() {
-        if let Ok(stream) = stream {
-            // Handle the connection!
-            handle_connection(stream, &state);
-        }
+
+    let mut threads = Vec::new();
+    for _ in 0..num_cpus::get() {
+        let listener_ref = listener.try_clone().unwrap();
+        let state_ref = state.clone();
+        threads.push(thread::spawn(move || {
+            for stream in listener_ref.incoming() {
+                if let Ok(stream) = stream {
+                    handle_connection(stream, &state_ref)
+                }
+            }
+        }))
+    }
+
+    for handle in threads {
+        handle.join().expect("thread panic");
     }
 }
 
