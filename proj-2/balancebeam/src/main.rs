@@ -2,10 +2,12 @@ mod request;
 mod response;
 
 use clap::Parser;
+use http::StatusCode;
 use rand::{Rng, SeedableRng};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
@@ -49,6 +51,8 @@ struct ProxyState {
     active_upstream_addresses: Arc<RwLock<Vec<String>>>,
     /// Addresses of all servers
     upstream_addresses: Vec<String>,
+    /// Rate monitor, counts access number for each upstream address per minute
+    rate_monitor: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 #[tokio::main]
@@ -85,9 +89,12 @@ async fn main() {
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
+        rate_monitor: Arc::new(Mutex::new(HashMap::new())),
     };
 
     start_health_check(&state);
+
+    start_rate_monitor(&state);
 
     loop {
         if let Ok((stream, _)) = listener.accept().await {
@@ -195,6 +202,14 @@ async fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
             request::format_request_line(&request)
         );
 
+        // When reach rate limit, respond to request with HTTP error 429 (Too Many Requests)
+        // rather than forwarding the requests to the upstream servers.
+        if let Err(status) = check_rate_limit(state, &upstream_ip).await {
+            let response = response::make_http_error(status);
+            send_response(&mut client_conn, &response).await;
+            continue;
+        }
+
         // Add X-Forwarded-For header so that the upstream server knows the client's IP address.
         // (We're the ones connecting directly to the upstream server, so without this header, the
         // upstream server will only know our IP, not the client's.)
@@ -277,4 +292,33 @@ async fn health_check(state: &ProxyState) {
             }
         }
     }
+}
+
+fn start_rate_monitor(state: &ProxyState) {
+    let state_ref = state.clone();
+    tokio::spawn(async move {
+        reset_rate_monitor(&state_ref).await;
+    });
+}
+
+async fn reset_rate_monitor(state: &ProxyState) {
+    time::sleep(time::Duration::from_secs(60)).await;
+
+    state.rate_monitor.lock().await.clear();
+}
+
+async fn check_rate_limit(state: &ProxyState, upstream: &str) -> Result<(), StatusCode> {
+    if state.max_requests_per_minute == 0 {
+        return Ok(());
+    }
+
+    let mut rate_monitor = state.rate_monitor.lock().await;
+    let rate = rate_monitor.entry(upstream.to_string()).or_default();
+    *rate += 1;
+    if *rate > state.max_requests_per_minute {
+        log::error!("reach maximum limit for stream {}", upstream.to_string());
+        return Err(http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    Ok(())
 }
