@@ -6,6 +6,7 @@ use rand::{Rng, SeedableRng};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use tokio::time;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -46,6 +47,8 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of healthy servers that we are proxying to
     active_upstream_addresses: Arc<RwLock<Vec<String>>>,
+    /// Addresses of all servers
+    upstream_addresses: Vec<String>,
 }
 
 #[tokio::main]
@@ -77,11 +80,14 @@ async fn main() {
 
     // Handle incoming connections
     let state = ProxyState {
+        upstream_addresses: options.upstream.clone(),
         active_upstream_addresses: Arc::new(RwLock::new(options.upstream)),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
     };
+
+    start_health_check(&state);
 
     loop {
         if let Ok((stream, _)) = listener.accept().await {
@@ -221,5 +227,54 @@ async fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
         // Forward the response to the client
         send_response(&mut client_conn, &response).await;
         log::debug!("Forwarded response to client");
+    }
+}
+
+fn start_health_check(state: &ProxyState) {
+    let state_ref = state.clone();
+    tokio::spawn(async move {
+        health_check(&state_ref).await;
+    });
+}
+
+async fn health_check(state: &ProxyState) {
+    loop {
+        time::sleep(time::Duration::from_secs(
+            state.active_health_check_interval as u64,
+        ))
+        .await;
+
+        let mut active_servers = state.active_upstream_addresses.write().await;
+        active_servers.clear();
+
+        for upstream in &state.upstream_addresses {
+            let request = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(&state.active_health_check_path)
+                .header("Host", upstream)
+                .body(Vec::<u8>::new())
+                .unwrap();
+
+            match TcpStream::connect(upstream).await {
+                Ok(mut stream) => {
+                    if let Err(err) = request::write_to_stream(&request, &mut stream).await {
+                        log::error!("failed to write to stream {}, {}", upstream, err);
+                    }
+
+                    if let Ok(resp) =
+                        response::read_from_stream(&mut stream, &request.method()).await
+                    {
+                        if http::StatusCode::OK == resp.status() {
+                            active_servers.push(upstream.clone());
+                        }
+                    } else {
+                        log::error!("failed to receive OK status from stream {}", upstream)
+                    }
+                }
+                Err(err) => {
+                    log::error!("failed to connect to stream {}, {}", upstream, err);
+                }
+            }
+        }
     }
 }
